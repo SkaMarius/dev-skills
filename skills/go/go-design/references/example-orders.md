@@ -4,7 +4,7 @@
 
 "A service that takes orders over HTTP, stores them in Postgres, and notifies a warehouse API when an order is paid."
 
-Nothing about the data blocks the design, so the design goes ahead and records its assumptions.
+It's a new service, and nothing about the data blocks the design, so the design goes ahead and records its assumptions. Whether the warehouse API accepts an idempotency key is an external fact, so the design covers both answers instead of asking.
 
 ## Output
 
@@ -29,33 +29,39 @@ favors simplicity over isolation; a change to the JSON shape touches the model.
   - Deliver: undelivered outbox entry -> warehouse API call -> entry marked delivered.
 
 ## Packages
-cmd/orders            reads config, builds logger and DB pool, wires packages,
-                      runs the HTTP server and delivery worker, handles shutdown
-internal/orderapi     HTTP handlers: decode, call order, encode, map errors to status codes
-internal/order        order model, state rules, Storer and Notifier interfaces, errors
-internal/order/orderdb  Postgres implementation of order.Storer
-internal/warehouse    warehouse API client, implements order.Notifier
-internal/sqldb        foundation: Postgres connection and transaction helpers
+cmd/orders              entry: reads config, builds logger and DB pool, wires
+                        packages, starts the server and worker, handles shutdown
+internal/orderapi       transport: HTTP handlers, decode, call order, encode,
+                        map errors to responses
+internal/orderworker    entry: delivery loop, calls order.DeliverPending on a timer
+internal/order          business: order model, validation, state rules,
+                        Storer and Notifier interfaces, errors
+internal/order/orderdb  storage: Postgres implementation of order.Storer
+internal/warehouse      outbound client: warehouse API, implements order.Notifier
+internal/sqldb          foundation: Postgres connection and transaction helpers
 
 ## Dependency rules
 - cmd/orders imports everything, for wiring only.
-- orderapi imports order.
+- orderapi and orderworker import order.
 - orderdb imports order and sqldb. warehouse imports order.
 - order imports only the standard library.
-- sqldb imports nothing internal. Nothing imports orderapi or cmd/orders.
+- sqldb imports nothing internal. Nothing imports orderapi, orderworker or cmd/orders.
+- No delegates.
 
 ## Transactions and side effects
-- Mark paid is one transaction inside orderdb: update the order where status is
-  pending, and insert an outbox entry. Zero rows updated means the order wasn't
-  pending, which returns order.ErrInvalidState. This also prevents double payment
-  under concurrent requests.
-- The warehouse is never called inside a request. The delivery worker picks
+- Mark paid: order loads the order, checks that pending -> paid is allowed, and
+  builds the paid order and its outbox entry. It passes both to Storer.MarkPaid,
+  which writes them in one transaction. The update only applies while the status
+  is still pending; zero rows updated returns order.ErrInvalidState. This guards
+  against two concurrent payment requests.
+- The warehouse is never called inside a request. order.DeliverPending picks
   undelivered entries (SKIP LOCKED, so several instances can run), calls the
-  warehouse with the order ID as idempotency key, and marks the entry delivered.
+  Notifier with the order ID as idempotency key, and marks each entry delivered.
 - On failure or timeout: increment Attempts and set NextAttemptAt with backoff.
-  After 10 attempts, stop retrying and log at error level.
-- On repeat (crash after the call, before marking delivered): the warehouse
-  receives the same idempotency key twice.
+  After 10 attempts, stop retrying and return an error for the worker to log.
+- On repeat (crash after the call, before marking delivered): if the warehouse
+  accepts an idempotency key, it ignores the second call. If not, it receives a
+  duplicate and must tolerate it.
 
 ## Error handling
 - orderdb turns sql.ErrNoRows into order.ErrNotFound and wraps other errors with
@@ -64,25 +70,31 @@ internal/sqldb        foundation: Postgres connection and transaction helpers
   wraps everything else with context.
 - orderapi maps ErrNotFound to 404, ErrInvalidState to 409, validation errors to
   400 with field messages, and everything else to 500 with a generic message.
-- Each request error is logged once, in middleware, with the request ID.
-  Worker errors are logged once, in the worker loop.
+- Errors are logged once at the top of each call chain: request middleware (with
+  the request ID) and the worker loop.
 
 ## Concurrency
 - Delivery worker: one goroutine, started by main after the server starts,
   stopped by context cancellation on shutdown; main waits for it to finish.
   It exists so a slow or down warehouse never blocks the payment request.
 
+## Cross-cutting
+- Auth: handled by a gateway in front of the service (assumption).
+- Migrations: SQL files applied by a separate command before deploy.
+- Timeouts: each request gets a context with a 10s deadline; each warehouse call
+  gets 5s. Contexts are passed down through every call.
+- Observability: structured logs with request ID. Metrics and tracing out of scope.
+
 ## Open questions, risks, left out
-- Assumption: the payment provider calls POST /orders/{id}/paid, and auth is
-  handled by a gateway in front of the service.
-- Open: does the warehouse API accept an idempotency key? If not, duplicates
-  are possible after a crash.
+- Assumption: the payment provider calls POST /orders/{id}/paid.
+- Open: does the warehouse API accept an idempotency key? The design works
+  either way (see above), but duplicates are possible if not.
 - Open: who is alerted when delivery gives up after 10 attempts?
 - Risk: the outbox table grows without bound; delivered entries need cleanup.
 - Left out: customer and product domains (stored as IDs only), order listing
-  and pagination, cancellation after payment, metrics. Switch to the full
-  layout if customers or products become their own domains or a second
-  transport (gRPC, a queue consumer) is added.
+  and pagination, cancellation after payment. Switch to the full layout if
+  customers or products become their own domains or a second transport
+  (gRPC, a queue consumer) is added.
 ```
 
 ## Common mistakes
@@ -95,6 +107,13 @@ Bad: "Mark paid commits the order, then calls the warehouse. If the warehouse fa
 The order is paid but the client sees an error, and the warehouse is never told.
 
 Good: write an outbox entry in the same transaction and deliver it from a worker with retries (rule 13).
+
+**Business rules in storage**
+
+Bad: "`orderdb.MarkPaid` checks the status and, if the order was pending, also inserts an outbox entry."
+The rule "a paid order notifies the warehouse" now lives in storage, where nobody looks for it.
+
+Good: `order` decides the state change and builds the outbox entry. `orderdb` writes both atomically, and its status condition only guards against concurrent requests. (rules 5 and 12)
 
 **Interface defined next to its implementation**
 
@@ -113,14 +132,14 @@ Good: each model lives in the package that owns it. A helper goes into a foundat
 Bad: "`orderdb` logs the query error and returns it. `order` logs it and returns it. The handler logs it."
 One failure produces three log lines with partial context.
 
-Good: return and wrap on the way up, and log once at the top (rule 11).
+Good: return and wrap on the way up, and log once at the top of the call chain (rule 11).
 
 **Domains importing each other**
 
 Bad: "`order` imports `customer` to check the customer exists, and `customer` imports `order` to count a customer's orders."
 That is an import cycle.
 
-Good: `order` may import `customer`. `customer` learns about new orders through a delegate event, or app combines both for the client. (rule 6)
+Good: `order` may import `customer`. `customer` learns about new orders through a delegate event, and the design says whether that event runs inside the transaction or after commit. Or app combines both for the client. (rule 6)
 
 **Speculative abstraction**
 
@@ -133,4 +152,10 @@ Good: one Postgres implementation. The interface exists because business code mu
 Bad: "The handler runs `go notifyWarehouse(order)` and returns."
 Nothing retries it, and shutdown kills it halfway.
 
-Good: one worker that main starts, stops through context cancellation, and waits for (rule 15).
+Good: one worker that main starts, stops through context cancellation, and waits for (rules 15 and 16).
+
+**Imposing the default layout on an existing service**
+
+Bad: a feature design for a service that uses `domain/`, `application/` and `infrastructure/` proposes new `business/` and `storage/` packages next to them.
+
+Good: map the roles onto the existing folders and follow the project's conventions (Existing services section).

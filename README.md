@@ -18,7 +18,7 @@ Go comes first. Other languages (React is next) will get their own folder when I
 
 The Go skills start from the data, keep packages focused, don't add abstractions until you need them, and aim for code people can read.
 
-Each rule is tagged. [Go] means widely agreed Go practice (Effective Go, Code Review Comments). [Opinion] means a deliberate choice that not everyone shares.
+Each rule is tagged. [Common] means widely agreed practice, from Go's own guides (Effective Go, Code Review Comments) or general engineering. [Opinion] means a deliberate choice that not everyone shares.
 
 Planned, roughly in order:
 

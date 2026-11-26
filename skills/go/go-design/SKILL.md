@@ -13,7 +13,7 @@ Rules are tagged [Common] for widely agreed practice and [Opinion] for an opinio
 
 ## Existing services
 
-When the service already exists, follow its current layout, naming and conventions. Map the roles in rule 5 onto what is there: `presentation/`, `application/`, `domain/` and `infrastructure/`, for example, are the same roles under other names. Treat [Opinion] rules as defaults that give way to the project's own choices. Keep the direction rules (6, 9, 11) unless the project clearly does otherwise. If the existing layout breaks them, list that as a risk instead of redesigning it, unless asked.
+When the service already exists, follow its current layout, naming and conventions. Map the roles in rule 5 onto what is there: `presentation/`, `application/`, `domain/` and `infrastructure/`, for example, are the same roles under other names. Treat [Opinion] rules as defaults that give way to the project's own choices. Keep the import direction, consumer-defined interfaces and the error rules (6, 9, 11) unless the project clearly does otherwise. If the existing layout breaks them, list that as a risk instead of redesigning it, unless asked.
 
 ## Process
 
@@ -67,7 +67,7 @@ See `references/example-orders.md` for a complete worked design and a list of co
 9. **Concrete types first.** Add an interface only for a real second implementation or a dependency that needs decoupling (storage, an external API). Define the interface in the package that uses it, not the one that implements it. [Common]
    Why: interfaces nobody needs add indirection, and consumer-defined interfaces stay small.
 
-10. **Use the lighter layout for small services.** With one domain and one transport: a transport package, one business package and its storage package, sharing the business model. With no app layer, validation lives in the business package. Always keep the import direction, consumer-defined interfaces and the error rules. Move to the full layout at two or more domains or two or more transports. [Opinion]
+10. **Use the lighter layout for small services.** With one domain and one transport: a transport package, one business package and its storage package, sharing the business model. With no app layer, validation lives in the business package. Always keep the import direction, consumer-defined interfaces and the error rules. Move to the full layout at two or more domains or two or more transports. An entry point counts as a transport if it brings in outside input with its own data shape (HTTP, gRPC, a queue consumer). A loop or scheduled job over the service's own data does not. [Opinion]
     Why: the full layout pays off when there are several domains and clients to keep apart. Below that it is mostly conversion code.
 
 ### Decide up front
@@ -75,7 +75,7 @@ See `references/example-orders.md` for a complete worked design and a list of co
 11. **Errors: the low level returns, the middle adds context, the top decides.** Low-level packages return the root cause. Layers above add context. The top of each call chain (request middleware, worker loop, `main`) logs the error once and decides the response. Decide which errors are safe to show the client and how they map to client responses. Return errors you can return; panic only for programmer errors and startup failures. [Common]
     Why: each error gets logged once with full context, and internal details never leak to clients.
 
-12. **Transactions: say where each one starts and ends.** Business decides what changes together; storage only makes it atomic. A transaction across domains starts at the top of the workflow (app or middleware) and is passed down, so each domain gets a storage bound to the same transaction. [Opinion]
+12. **Transactions: say where each one starts and ends.** Business decides what changes together; storage only makes it atomic. A transaction across domains starts at the workflow's entry point in app and is passed down, so each domain gets a storage bound to the same transaction. Keep it as short as the workflow allows, and never hold it open across an external call. [Opinion]
     Why: transaction scope decides what can be half-written after a failure, which is an integrity question.
 
 13. **Side effects outside the database: plan for failure and repeats.** For every external API call, queue message or email, decide what happens when it fails, times out or runs twice. Options include retry with backoff, an outbox table written in the same transaction, and an idempotency key. [Common]

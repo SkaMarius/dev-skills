@@ -14,7 +14,8 @@ It's a new service, and nothing about the data blocks the design, so the design 
 ## Summary
 Accepts orders over HTTP, stores them in Postgres, and tells the warehouse API
 when an order is paid. One domain (order) and one transport (HTTP), so it uses
-the lighter layout. Trade-off: the HTTP layer shares the business model, which
+the lighter layout; the delivery worker loops over the service's own data, so
+it is not a second transport. Trade-off: the HTTP layer shares the business model, which
 favors simplicity over isolation; a change to the JSON shape touches the model.
 
 ## Data
@@ -54,14 +55,18 @@ internal/sqldb          foundation: Postgres connection and transaction helpers
   which writes them in one transaction. The update only applies while the status
   is still pending; zero rows updated returns order.ErrInvalidState. This guards
   against two concurrent payment requests.
-- The warehouse is never called inside a request. order.DeliverPending picks
-  undelivered entries (SKIP LOCKED, so several instances can run), calls the
-  Notifier with the order ID as idempotency key, and marks each entry delivered.
+- The warehouse is never called inside a request or inside a transaction.
+  order.DeliverPending claims entries with Storer.ClaimPending, which in one
+  short transaction selects due entries (SKIP LOCKED), pushes NextAttemptAt
+  30s ahead as a lease, and commits. Other instances skip leased entries. order
+  then calls the Notifier with the order ID as idempotency key and marks each
+  entry delivered. The 30s lease is longer than the 5s call timeout.
 - On failure or timeout: increment Attempts and set NextAttemptAt with backoff.
   After 10 attempts, stop retrying and return an error for the worker to log.
-- On repeat (crash after the call, before marking delivered): if the warehouse
-  accepts an idempotency key, it ignores the second call. If not, it receives a
-  duplicate and must tolerate it.
+- Delivery is at least once, not exactly once. On repeat (crash after the call,
+  before marking delivered, so the lease expires and the entry is sent again):
+  if the warehouse accepts an idempotency key, it ignores the second call. If
+  not, it receives a duplicate and must tolerate it.
 
 ## Error handling
 - orderdb turns sql.ErrNoRows into order.ErrNotFound and wraps other errors with
